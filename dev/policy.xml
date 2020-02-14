@@ -1,0 +1,158 @@
+<policies>
+    <inbound>
+        <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete"/>
+        <set-header name="Forwarded" exists-action="override">
+            <value>@("proto=" + context.Request.OriginalUrl.Scheme + ";host=" + context.Request.OriginalUrl.Host +
+                ";")
+            </value>
+        </set-header>
+        <!-- Forward IP to allow backend to check -->
+        <set-header name="Forwarded-IP" exists-action="override">
+            <value>@("IP=" + context.Request.IpAddress + ";")</value>
+        </set-header>
+        <choose>
+            <when condition="@(context.Request.Headers.ContainsKey(" NAV-Samtykke-Token"))">
+            <!--  Not working due to Azure demands well-known endpoint For RS256, Microsoft: "the key has to be provide via an Open ID configuration endpoint"
+            * Not something Altinn provides, the only provide the certificates in .zip format for verifying the signature.
+            * Microsoft is only made this feature avalible for for HS256 (Shared secrert) -->
+            <!-- ensure presence of Samtykke header for backend -->
+            <set-header name="NAV-Samtykke-Token" exists-action="override">
+                <value>@(context.Request.Headers.GetValueOrDefault("NAV-Samtykke-Token"))</value>
+            </set-header>
+        </when>
+    </choose>
+    <!--
+    Using a message id to correlate the two, we get a bit more flexibility in the message size
+    -->
+    <set-variable name="message-id" value="@(context.Request.Headers.GetValueOrDefault(" NAV-Correlation-Id","missing
+    correlation ID"))" />
+    <!--
+    chose to send HTTP request messages to one partition and HTTP response messages to a second partition.
+    This ensures an even load distribution and we can guarantee that all requests will be consumed in
+    order and all responses are consumed in order.
+    -->
+    <log-to-eventhub logger-id="nav-apim-preprod-logger" partition-id="0">@{
+        var requestLine = string.Format("{0} {1} HTTP/1.1\r\n",
+        context.Request.Method,
+        context.Request.Url.Path + context.Request.Url.QueryString);
+        // strip out certain security sensitive fields
+        var headers = context.Request.Headers
+        .Where(h => h.Key != "Ocp-Apim-Subscription-Key"  && h.Key != "NAV-Samtykke-Token"  && h.Key != "Authorization")
+        .Select(h => string.Format("{0}: {1}", h.Key, String.Join(", ", h.Value)))
+        .ToArray<string>();
+
+        var headerString = (headers.Any()) ? string.Join("\r\n", headers) + "\r\n" : string.Empty;
+
+        return "request:" + context.Variables["message-id"] + "\n"
+        + requestLine + headerString + "\r\n";
+        }
+    </log-to-eventhub>
+    <authentication-certificate thumbprint="{{NAVBackendCertiticate}}"/>
+</inbound>
+<backend>
+<!--
+Do something with the response to backend (Only 1 policy allowed)
+Redirect to backend, timeout should be 180 - 300-->
+<forward-request timeout="300" follow-redirects="false"/>
+</backend>
+<outbound>
+<!--Do something with the response to klient-->
+<!-- Remove valus in header in response from backend -->
+<set-header name="NAV-Samtykke-Token" exists-action="delete"/>
+<set-header name="x-nav-apiKey" exists-action="delete"/>
+<set-header name="NAV-Correlation-Id" exists-action="override">
+    <value>@(context.Request.Headers.GetValueOrDefault("NAV-Correlation-Id"))</value>
+</set-header>
+<log-to-eventhub logger-id="nav-apim-preprod-logger" partition-id="1">@{
+    var statusLine = string.Format("HTTP/1.1 {0} {1}\r\n",
+    context.Response.StatusCode,
+    context.Response.StatusReason);
+    var headers = context.Response.Headers
+    .Where(h => h.Key != "Ocp-Apim-Subscription-Key"  && h.Key != "NAV-Samtykke-Token"  && h.Key != "Authorization")
+    .Select(h => string.Format("{0}: {1}", h.Key, String.Join(", ", h.Value)))
+    .ToArray<string>();
+
+    var headerString = (headers.Any()) ? string.Join("\r\n", headers) + "\r\n" : string.Empty;
+
+    return "response:" + context.Variables["message-id"] + "\n"
+    + statusLine + headerString + "\r\n";
+    }
+</log-to-eventhub>
+</outbound>
+<on-error>
+<!--
+Add to #slack if >= 400
+-->
+<choose>
+    <when condition="@(context.Response.StatusCode >= 400)">
+        <set-variable name="corrId" value="@(context.Request.Headers.GetValueOrDefault(" NAV-Correlation-Id","missing
+        correlation ID"))" />
+        <set-variable name="userEmail" value="@{
+                                                        string value;
+                                                        if (context.User != null)
+                                                          {
+                                                             if(context.User.Email != null)
+                                                            {
+                                                                value = (string)context.User.Email.Clone();
+                                                            }
+                                                            else
+                                                            {
+                                                                value = " Unknown Email";
+                                                            }
+                                                        }
+                                                        else
+                                                        {
+                                                            value = "Anonymous User";
+                                                        }
+                                                        return value;
+                                                        }" />
+        <send-one-way-request mode="new">
+            <set-url>{{azuregwslackurl}}</set-url>
+            <set-method>POST</set-method>
+            <set-body>@{
+                return new JObject(
+                new JProperty("username","APIM Alert"),
+                new JProperty("icon_emoji", ":ghost:"),
+                new JProperty("text", String.Format("API: {0} \nMethod: {1} \nPath: {2} \nHost: {3} \nStatus: {4}
+                {5}\nError: {6} \nMessage: {7} \nNAV-Correlation-Id: {8} \nUser: {9}",
+                context.Api.Name,
+                context.Request.Method,
+                context.Request.Url.Path + context.Request.Url.QueryString,
+                context.Request.Url.Host,
+                context.Response.StatusCode,
+                context.Response.StatusReason,
+                context.LastError.Source,
+                context.LastError.Message,
+                context.RequestId,
+                context.Variables["userEmail"]
+                ))
+                ).ToString();
+                }
+            </set-body>
+        </send-one-way-request>
+    </when>
+</choose>
+<!--
+Error Response to Client
+-->
+<set-variable name="Correlation-Id" value="@(context.Request.Headers.GetValueOrDefault(" NAV-Correlation-Id","missing
+correlation ID"))" />
+<return-response>
+    <set-status code="@(context.Response.StatusCode)" reason="@(context.Response.StatusReason.ToString())"/>
+    <set-header name="NAV-Correlation-Id" exists-action="override">
+        <value>@(context.Request.Headers.GetValueOrDefault("NAV-Correlation-Id"))</value>
+    </set-header>
+    <set-body>@{
+        // This error response is used for 400 to
+        <
+        500
+        return new JObject(
+        new JProperty("ErrorStatusCode", ((context.Response.StatusCode).ToString())),
+        new JProperty("ErrorMessage", ((context.LastError.Message).ToString())),
+        new JProperty("CorrelationId", (context.Variables["Correlation-Id"]))
+        ).ToString();
+        }
+    </set-body>
+</return-response>
+</on-error>
+        </policies>
